@@ -1,0 +1,366 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p $(dirname settings.gradle.kts)
+          cat > settings.gradle.kts <<'EOF_FILE'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "VoiceChanger"
+          include(":app")
+          EOF_FILE
+          mkdir -p $(dirname build.gradle.kts)
+          cat > build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/build.gradle.kts)
+          cat > app/build.gradle.kts <<'EOF_FILE'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.voicechanger"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.voicechanger"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions { sourceCompatibility = JavaVersion.VERSION_17; targetCompatibility = JavaVersion.VERSION_17 }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'EOF_FILE'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <application android:label="Voice Changer" android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/voicechanger/VoiceEngine.kt)
+          cat > app/src/main/java/com/example/voicechanger/VoiceEngine.kt <<'EOF_FILE'
+          package com.example.voicechanger
+
+          import android.annotation.SuppressLint
+          import android.media.*
+          import kotlin.math.PI
+          import kotlin.math.abs
+          import kotlin.math.sin
+
+          enum class Fx { NONE, ROBOT, HIGH, LOW, ECHO, GOJO, SUKUNA }
+
+          /** Простой питч-шифтер: две линии задержки с треугольным кроссфейдом. */
+          class PitchShifter(private val ratio: Float) {
+              private val win = 1024
+              private val buf = FloatArray(4096)
+              private var w = 0
+              private var phase = 0f
+              private fun read(d: Float): Float {
+                  val pos = (w - d + buf.size) % buf.size
+                  val i = pos.toInt(); val f = pos - i
+                  return buf[i] * (1 - f) + buf[(i + 1) % buf.size] * f
+              }
+              fun process(x: Float): Float {
+                  buf[w] = x
+                  val d1 = phase
+                  val d2 = (phase + win / 2f) % win
+                  val g1 = 1f - abs(2f * d1 / win - 1f)
+                  val g2 = 1f - abs(2f * d2 / win - 1f)
+                  val y = read(d1) * g1 + read(d2) * g2
+                  w = (w + 1) % buf.size
+                  phase += 1f - ratio
+                  if (phase >= win) phase -= win
+                  if (phase < 0) phase += win
+                  return y
+              }
+          }
+
+          class VoiceEngine {
+              @Volatile var fx = Fx.NONE
+              @Volatile private var running = false
+              private var thread: Thread? = null
+              private val sr = 44100
+
+              @SuppressLint("MissingPermission")
+              fun start(input: AudioDeviceInfo?) {
+                  if (running) return
+                  running = true
+                  thread = Thread {
+                      val minIn = AudioRecord.getMinBufferSize(sr, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                      val minOut = AudioTrack.getMinBufferSize(sr, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                      val rec = AudioRecord(MediaRecorder.AudioSource.MIC, sr, AudioFormat.CHANNEL_IN_MONO,
+                          AudioFormat.ENCODING_PCM_16BIT, minIn)
+                      if (input != null) rec.preferredDevice = input
+                      val track = AudioTrack.Builder()
+                          .setAudioAttributes(AudioAttributes.Builder()
+                              .setUsage(AudioAttributes.USAGE_MEDIA)
+                              .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                          .setAudioFormat(AudioFormat.Builder().setSampleRate(sr)
+                              .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                              .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+                          .setBufferSizeInBytes(minOut)
+                          .setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY).build()
+                      val high = PitchShifter(1.5f)
+                      val low = PitchShifter(0.7f)
+                      val gojo = PitchShifter(0.9f)
+                      val suku = PitchShifter(0.68f)
+                      val echo = FloatArray(sr * 3 / 10); var ei = 0
+                      var t = 0.0
+                      val buf = ShortArray(512)
+                      rec.startRecording(); track.play()
+                      while (running) {
+                          val n = rec.read(buf, 0, buf.size)
+                          for (i in 0 until n) {
+                              val x = buf[i] / 32768f
+                              val y = when (fx) {
+                                  Fx.NONE -> x
+                                  Fx.ROBOT -> { t += 1.0 / sr; x * sin(2 * PI * 60 * t).toFloat() * 1.4f }
+                                  Fx.HIGH -> high.process(x)
+                                  Fx.LOW -> low.process(x)
+                                  Fx.GOJO -> gojo.process(x) * 1.2f
+                                  Fx.SUKUNA -> { val p = suku.process(x) * 2.5f; val c = Math.tanh(p.toDouble()).toFloat()
+                                      val d = echo[ei]; echo[ei] = c + d * 0.3f; ei = (ei + 1) % echo.size; c + d * 0.25f }
+                                  Fx.ECHO -> { val d = echo[ei]; echo[ei] = x + d * 0.4f; ei = (ei + 1) % echo.size; x + d * 0.5f }
+                              }
+                              buf[i] = (y.coerceIn(-1f, 1f) * 32767).toInt().toShort()
+                          }
+                          track.write(buf, 0, n)
+                      }
+                      rec.stop(); rec.release(); track.stop(); track.release()
+                  }.also { it.start() }
+              }
+
+              fun stop() { running = false; thread?.join(500); thread = null }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/voicechanger/ServerEngine.kt)
+          cat > app/src/main/java/com/example/voicechanger/ServerEngine.kt <<'EOF_FILE'
+          package com.example.voicechanger
+
+          import android.annotation.SuppressLint
+          import android.media.*
+          import java.io.DataInputStream
+          import java.net.InetSocketAddress
+          import java.net.Socket
+
+          /** Шлёт микрофон (PCM16, 16 кГц, моно) на сервер и играет то, что вернулось. */
+          class ServerEngine {
+              @Volatile private var running = false
+              private var socket: Socket? = null
+              private val sr = 16000
+              private val chunk = 4096 // сэмплов (256 мс), должно совпадать с CHUNK в server.py
+
+              @SuppressLint("MissingPermission")
+              fun start(input: AudioDeviceInfo?, host: String, port: Int, voice: String, onError: (String) -> Unit) {
+                  if (running) return
+                  running = true
+                  Thread {
+                      var rec: AudioRecord? = null
+                      var track: AudioTrack? = null
+                      try {
+                          val s = Socket(); s.tcpNoDelay = true
+                          s.connect(InetSocketAddress(host, port), 5000); socket = s
+                          val out = s.getOutputStream()
+                          out.write("$voice\n".toByteArray()); out.flush()
+                          val inp = DataInputStream(s.getInputStream())
+
+                          val bytes = chunk * 2
+                          val minIn = AudioRecord.getMinBufferSize(sr, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                          val minOut = AudioTrack.getMinBufferSize(sr, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
+                          val r = AudioRecord(MediaRecorder.AudioSource.MIC, sr, AudioFormat.CHANNEL_IN_MONO,
+                              AudioFormat.ENCODING_PCM_16BIT, maxOf(minIn, bytes * 2))
+                          if (input != null) r.preferredDevice = input
+                          val t = AudioTrack.Builder()
+                              .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA)
+                                  .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH).build())
+                              .setAudioFormat(AudioFormat.Builder().setSampleRate(sr)
+                                  .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                                  .setChannelMask(AudioFormat.CHANNEL_OUT_MONO).build())
+                              .setBufferSizeInBytes(maxOf(minOut, bytes * 2)).build()
+                          rec = r; track = t
+                          r.startRecording(); t.play()
+
+                          Thread {
+                              val b = ByteArray(bytes)
+                              try { while (running) { inp.readFully(b); t.write(b, 0, bytes) } } catch (_: Exception) {}
+                          }.start()
+
+                          val buf = ByteArray(bytes)
+                          while (running) {
+                              var o = 0
+                              while (o < bytes && running) {
+                                  val n = r.read(buf, o, bytes - o)
+                                  if (n <= 0) break
+                                  o += n
+                              }
+                              if (o == bytes) out.write(buf)
+                          }
+                      } catch (e: Exception) {
+                          if (running) onError(e.message ?: "Ошибка соединения")
+                      } finally {
+                          running = false
+                          try { socket?.close() } catch (_: Exception) {}
+                          try { rec?.stop(); rec?.release() } catch (_: Exception) {}
+                          try { track?.stop(); track?.release() } catch (_: Exception) {}
+                      }
+                  }.start()
+              }
+
+              fun stop() { running = false; try { socket?.close() } catch (_: Exception) {} }
+          }
+          EOF_FILE
+          mkdir -p $(dirname app/src/main/java/com/example/voicechanger/MainActivity.kt)
+          cat > app/src/main/java/com/example/voicechanger/MainActivity.kt <<'EOF_FILE'
+          package com.example.voicechanger
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.pm.PackageManager
+          import android.media.AudioDeviceInfo
+          import android.media.AudioManager
+          import android.os.Bundle
+          import android.widget.*
+          import java.net.*
+
+          class MainActivity : Activity() {
+              private val engine = VoiceEngine()
+              private val server = ServerEngine()
+              private var devices = listOf<AudioDeviceInfo>()
+              private lateinit var spinner: Spinner
+              private lateinit var toggle: Button
+              private lateinit var ip: EditText
+              private lateinit var port: EditText
+              private var selected = 1
+              private var on = false
+
+              override fun onCreate(s: Bundle?) {
+                  super.onCreate(s)
+                  val pad = (16 * resources.displayMetrics.density).toInt()
+                  val root = ScrollView(this)
+                  val col = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL; setPadding(pad, pad * 2, pad, pad) }
+                  root.addView(col)
+                  col.addView(TextView(this).apply { text = "Смена голоса (лучше в наушниках)"; textSize = 20f })
+
+                  val am = getSystemService(AUDIO_SERVICE) as AudioManager
+                  devices = am.getDevices(AudioManager.GET_DEVICES_INPUTS).toList()
+                  spinner = Spinner(this)
+                  spinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item,
+                      devices.map { "${it.productName} (${it.type})" })
+                  col.addView(spinner)
+
+                  val group = RadioGroup(this)
+                  val names = listOf("Без эффекта", "Робот", "Высокий голос", "Низкий голос", "Эхо",
+                      "Годжо (имитация, в телефоне)", "Сукуна (имитация, в телефоне)",
+                      "Годжо (сервер, настоящий)", "Сукуна (сервер, настоящий)")
+                  names.forEachIndexed { i, n -> group.addView(RadioButton(this).apply { text = n; id = i + 1 }) }
+                  group.check(1)
+                  group.setOnCheckedChangeListener { _, id ->
+                      selected = id
+                      if (id <= 7) engine.fx = Fx.values()[id - 1]
+                  }
+                  col.addView(group)
+
+                  ip = EditText(this).apply { hint = "IP сервера, например 192.168.1.5"; setSingleLine() }
+                  port = EditText(this).apply { hint = "Порт"; setText("5005"); setSingleLine() }
+                  ip.setText(getSharedPreferences("vc", 0).getString("ip", ""))
+                  col.addView(ip); col.addView(port)
+                  val find = Button(this).apply { text = "Найти сервер автоматически" }
+                  find.setOnClickListener {
+                      find.text = "Ищу..."
+                      Thread {
+                          var found: String? = null
+                          try {
+                              DatagramSocket().use { s ->
+                                  s.broadcast = true; s.soTimeout = 2500
+                                  val msg = "VC?".toByteArray()
+                                  s.send(DatagramPacket(msg, msg.size, InetAddress.getByName("255.255.255.255"), 5006))
+                                  val p = DatagramPacket(ByteArray(64), 64)
+                                  s.receive(p); found = p.address.hostAddress
+                              }
+                          } catch (_: Exception) {}
+                          val f = found
+                          runOnUiThread {
+                              find.text = "Найти сервер автоматически"
+                              if (f != null) { ip.setText(f); Toast.makeText(this, "Найден: $f", Toast.LENGTH_SHORT).show() }
+                              else Toast.makeText(this, "Сервер не найден. Запущен ли server.py?", Toast.LENGTH_LONG).show()
+                          }
+                      }.start()
+                  }
+                  col.addView(find)
+
+                  toggle = Button(this).apply { text = "Включить микрофон" }
+                  toggle.setOnClickListener { if (on) stopAll() else ensurePermAndStart() }
+                  col.addView(toggle)
+                  setContentView(root)
+              }
+
+              private fun ensurePermAndStart() {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) startAll()
+                  else requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1)
+              }
+
+              override fun onRequestPermissionsResult(c: Int, p: Array<out String>, r: IntArray) {
+                  if (r.isNotEmpty() && r[0] == PackageManager.PERMISSION_GRANTED) startAll()
+              }
+
+              private fun startAll() {
+                  val dev = devices.getOrNull(spinner.selectedItemPosition)
+                  if (selected <= 7) {
+                      engine.start(dev)
+                  } else {
+                      val voice = if (selected == 8) "gojo" else "sukuna"
+                      val p = port.text.toString().toIntOrNull() ?: 5005
+                      getSharedPreferences("vc", 0).edit().putString("ip", ip.text.toString().trim()).apply()
+                      server.start(dev, ip.text.toString().trim(), p, voice) { msg ->
+                          runOnUiThread {
+                              Toast.makeText(this, "Сервер: $msg", Toast.LENGTH_LONG).show()
+                              on = false; toggle.text = "Включить микрофон"
+                          }
+                      }
+                  }
+                  on = true; toggle.text = "Выключить микрофон"
+              }
+
+              private fun stopAll() {
+                  engine.stop(); server.stop()
+                  on = false; toggle.text = "Включить микрофон"
+              }
+
+              override fun onDestroy() { engine.stop(); server.stop(); super.onDestroy() }
+          }
+          EOF_FILE
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+      - run: gradle assembleDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: VoiceChanger-apk
+          path: app/build/outputs/apk/debug/app-debug.apk
